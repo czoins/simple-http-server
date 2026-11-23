@@ -1,0 +1,1813 @@
+# GitHub Actions workflow: build simple-http-server for Windows with
+# working OpenSSL-based TLS - no Rust toolchain needed on your machine.
+#
+# WEB-ONLY USAGE (no CLI, no local build tools):
+#   1. Fork https://github.com/thewawar/simple-http-server (button, top right).
+#   2. In YOUR fork (github.com/<you>/simple-http-server):
+#      "Add file" -> "Create new file" ->
+#      name it:  .github/workflows/build-simple-http-server.yml
+#      paste this whole file as the content -> "Commit changes".
+#   3. Open the "Actions" tab of your fork -> click
+#      "I understand my workflows, go ahead and enable them".
+#   4. Left sidebar: "Build simple-http-server (Windows, TLS via OpenSSL)"
+#      -> "Run workflow" button -> "Run workflow" (branch: main).
+#   5. Wait ~10-15 min for the green check. Open that run ->
+#      scroll to "Artifacts" at the bottom -> download both zips.
+#      Each zip contains the .exe plus a short USAGE.txt.
+#
+# What you get (Windows x64, both with OpenSSL TLS instead of Schannel):
+#   - v0.8.0  built from upstream source with `--features tls`
+#             (no source changes; TLS 1.2/1.3; same --cert/--certpass CLI)
+#   - v0.6.1  upstream source with a surgical patch: the 2021-era
+#             hyper-native-tls/Schannel server path is replaced by an
+#             OpenSSL acceptor (identical CLI, identical p12 handling).
+#             This is the build to use if you liked 0.6.1's behavior.
+#
+# The v0.6.1 patch embedded below is exactly the tree that was compiled and
+# runtime-validated end-to-end (TLS 1.3 + HTTP 200 with a two-password
+# PKCS#12, full chain served, SAN mismatch correctly rejected).
+
+name: Build simple-http-server (Windows, TLS via OpenSSL)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  v080-tls:
+    name: v0.8.0 + tls feature (upstream, vendored OpenSSL)
+    runs-on: windows-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      # Build vendored OpenSSL without assembly: removes the NASM
+      # requirement, works on any Windows runner image.
+      OPENSSL_NO_ASM: '1'
+    steps:
+      - name: Check out tag v0.8.0
+        uses: actions/checkout@v4
+        with:
+          ref: v0.8.0
+
+      - name: Ensure stable Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --features tls
+
+      - name: Smoke test (serve HTTPS with a throwaway self-signed p12)
+        shell: bash
+        run: |
+          set -e
+          command -v openssl >/dev/null || { echo '::error::openssl not found in Git Bash'; exit 1; }
+          command -v curl    >/dev/null || { echo '::error::curl not found'; exit 1; }
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$RUNNER_TEMP/k.pem" -out "$RUNNER_TEMP/c.pem" \
+            -days 2 -subj "//CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+          openssl pkcs12 -export -out "$RUNNER_TEMP/t.p12" -inkey "$RUNNER_TEMP/k.pem" -in "$RUNNER_TEMP/c.pem" \
+            -passout pass:test1234 2>/dev/null
+          ./target/release/simple-http-server.exe --cert "$RUNNER_TEMP/t.p12" --certpass test1234 \
+            --ip 127.0.0.1 --port 8443 . &
+          SPID=$!
+          sleep 4
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ || true)
+          kill $SPID 2>/dev/null || true
+          echo "HTTPS smoke test HTTP status: $code"
+          if [ "$code" != "200" ]; then echo "::error::smoke test failed (status $code)"; exit 1; fi
+          echo "Smoke test PASSED: the exe serves HTTPS."
+
+      - name: Write usage note
+        shell: bash
+        run: |
+          cat > USAGE.txt <<'EOF_USAGE'
+          simple-http-server v0.8.0 - TLS build (upstream, --features tls)
+          ================================================================
+
+          Upstream v0.8.0 source, built with the `tls` feature, which statically links
+          OpenSSL on Windows (Schannel is not involved). No source modifications.
+
+          Usage is upstream v0.8.0's; certificates are still PKCS#12:
+
+              simple-http-server.exe --cert local.p12 --certpass <export-password> --ip 0.0.0.0 --port 8001 <root-dir>
+
+          Notes:
+          - --certpass takes the PKCS#12 EXPORT password.
+          - Downloaded exes may be flagged by SmartScreen (unsigned build): right-click
+            -> Properties -> Unblock, or "More info" -> "Run anyway" when running.
+          EOF_USAGE
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-http-server-v0.8.0-tls-windows-x64
+          path: |
+            target/release/simple-http-server.exe
+            USAGE.txt
+          if-no-files-found: error
+
+  v061-openssl:
+    name: v0.6.1 patched to OpenSSL TLS (replaces Schannel)
+    runs-on: windows-latest
+    env:
+      # The v0.6.1 tag pins rust-toolchain to 1.42.0 (too old for modern
+      # crates.io); force the modern stable toolchain instead.
+      RUSTUP_TOOLCHAIN: stable
+      OPENSSL_NO_ASM: '1'
+    steps:
+      - name: Check out tag v0.6.1
+        uses: actions/checkout@v4
+        with:
+          ref: v0.6.1
+
+      - name: Ensure stable Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Normalize line endings to LF (so the patch applies cleanly)
+        shell: bash
+        run: |
+          git config core.autocrlf false
+          git rm --cached -r -q .
+          git reset --hard -q
+
+      - name: Overlay patched files (Cargo.toml, src/tls.rs, vendored traitobject, Cargo.lock)
+        shell: bash
+        run: |
+          mkdir -p vendor/traitobject/src
+          cat > Cargo.toml <<'EOF_CARGO_TOML'
+          [package]
+          name = "simple-http-server"
+          version = "0.6.1"
+          authors = ["thewawar <thewawar@gmail.com>"]
+          license = "MIT"
+          description = "Simple HTTP server"
+          readme = "README.md"
+          keywords = ["simple", "http", "server", "static", "file"]
+          repository = "https://github.com/TheWaWaR/simple-http-server"
+          edition = "2018"
+
+          [dependencies]
+          clap = "2.33.0"
+          termcolor = "1.0.5"
+          lazy_static = "1.4.0"
+          time = "0.1.42"
+          chrono = "0.4.9"
+          flate2 = "1.0.11"
+          filetime = "0.2.7"
+          pretty-bytes = "0.2.2"
+          url = "2.1.0"
+          # TLS backend: OpenSSL on every platform (replaces hyper-native-tls, which
+          # used the platform's native TLS = Schannel on Windows and is what caused
+          # the per-connection resets on hardened Windows machines).
+          openssl = { version = "0.10", optional = true }
+          mime_guess = "2.0"
+          open = "1"
+          # Iron crates
+          iron = "0.6.1"
+          # Direct dep: src/tls.rs implements hyper's SslServer/NetworkStream traits
+          # (same version iron 0.6.1 uses, so it unifies with the existing one).
+          hyper = "0.10.16"
+          iron-cors = "0.8.0"
+          multipart = { version = "0.16.1", features = ["iron"] }
+          htmlescape = "0.3.1"
+          percent-encoding = "2.1.0"
+          path-dedot = "1"
+
+          [target.'cfg(windows)'.dependencies]
+          # Vendored = static OpenSSL compiled into the exe by the openssl crate
+          # (needs only Perl on the build machine; set OPENSSL_NO_ASM=1 to also skip
+          # the NASM requirement). Identical to how upstream v0.8.0 does its Windows
+          # TLS builds.
+          openssl = { version = "0.10", optional = true, features = ["vendored"] }
+
+          [features]
+          default = ["tls"]
+          tls = ["dep:openssl"]
+
+          [patch.crates-io]
+          # 2015-era crate pulled in via iron -> plugin -> typemap; its impls.rs breaks
+          # on modern rustc (trait-object bounds are now deduplicated, E0119). Vendored
+          # copy with the duplicated marker impls removed - see vendor/traitobject/.
+          traitobject = { path = "vendor/traitobject" }
+          EOF_CARGO_TOML
+          cat > src/tls.rs <<'EOF_TLS_RS'
+          //! TLS (HTTPS) support for hyper 0.10 via the `openssl` crate.
+          //!
+          //! Drop-in replacement for the `hyper-native-tls` server wrapper that
+          //! simple-http-server v0.6.1 originally used. The CLI is unchanged
+          //! (`--cert <file.p12> --certpass <password>`; the p12's *export* password,
+          //! as before), but the TLS engine is OpenSSL on every platform instead of
+          //! the platform's native TLS. On Windows that means Schannel is bypassed
+          //! entirely - relevant on machines where Schannel's server-side policy
+          //! (e.g. cipher-suite restrictions under
+          //! `HKLM\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002`)
+          //! rejects everything the old SCHANNEL_CRED-based code could negotiate,
+          //! which surfaces as an instant connection reset for every client.
+          //!
+          //! Mirrors the structure of hyper-native-tls 0.3.0 (same `SslServer`
+          //! plumbing, same Arc<Mutex> stream shape required by hyper 0.10's
+          //! `SslServer::Stream: NetworkStream + Send + Clone` bound), so the
+          //! integration with iron's `Iron::https()` is unchanged.
+
+          use std::error::Error as StdError;
+          use std::fmt;
+          use std::fs::File;
+          use std::io::{self, Read, Write};
+          use std::net::SocketAddr;
+          use std::path::Path;
+          use std::sync::{Arc, Mutex, MutexGuard};
+          use std::time::Duration;
+
+          use hyper::net::NetworkStream;
+          use openssl::pkcs12::Pkcs12;
+          use openssl::ssl::{SslAcceptor, SslMethod, SslStream, SslVersion};
+
+          /// A hyper `NetworkStream` backed by an OpenSSL `SslStream`.
+          ///
+          /// `Clone` + interior mutability are required by hyper 0.10's
+          /// `SslServer::Stream` bound; `Arc<Mutex<..>>` is the same shape
+          /// hyper-native-tls used for its stream type.
+          pub struct TlsStream<S>(Arc<Mutex<SslStream<S>>>);
+
+          impl<S> Clone for TlsStream<S> {
+              fn clone(&self) -> Self {
+                  TlsStream(Arc::clone(&self.0))
+              }
+          }
+
+          impl<S> fmt::Debug for TlsStream<S> {
+              fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                  f.write_str("TlsStream")
+              }
+          }
+
+          fn lock<S>(m: &Mutex<S>) -> MutexGuard<'_, S> {
+              // A poisoned mutex only means the previous holder panicked (e.g. a
+              // client that disappeared mid-read); the stream itself is still
+              // usable enough for the next lock holder to finish or shut down.
+              m.lock().unwrap_or_else(|e| e.into_inner())
+          }
+
+          impl<S: Read + Write> Read for TlsStream<S> {
+              fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                  lock(&self.0).read(buf)
+              }
+          }
+
+          impl<S: Read + Write> Write for TlsStream<S> {
+              fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                  lock(&self.0).write(buf)
+              }
+
+              fn flush(&mut self) -> io::Result<()> {
+                  lock(&self.0).flush()
+              }
+          }
+
+          impl<S: NetworkStream> NetworkStream for TlsStream<S> {
+              fn peer_addr(&mut self) -> io::Result<SocketAddr> {
+                  lock(&self.0).get_mut().peer_addr()
+              }
+
+              fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+                  lock(&self.0).get_ref().set_read_timeout(dur)
+              }
+
+              fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+                  lock(&self.0).get_ref().set_write_timeout(dur)
+              }
+          }
+
+          /// A hyper `SslServer` implemented with OpenSSL.
+          #[derive(Clone)]
+          pub struct OpenSslServer(Arc<SslAcceptor>);
+
+          impl OpenSslServer {
+              /// Build from a PKCS#12 (.p12) file and its password - same signature
+              /// and same semantics as the old `NativeTlsServer::new(path, password)`.
+              ///
+              /// The certificate, private key and any extra chain certificates (e.g.
+              /// the CA) inside the bundle are all installed into the acceptor.
+              pub fn new<P: AsRef<Path>>(path: P, password: &str) -> Result<OpenSslServer, ServerError> {
+                  let mut buf = Vec::new();
+                  File::open(path.as_ref())
+                      .and_then(|mut f| f.read_to_end(&mut buf))
+                      .map_err(ServerError::Io)?;
+
+                  let pkcs12 = Pkcs12::from_der(&buf).map_err(ServerError::Tls)?;
+                  let parsed = pkcs12.parse2(password).map_err(ServerError::Tls)?;
+                  let cert = parsed
+                      .cert
+                      .ok_or(ServerError::BadBundle("no certificate found in PKCS#12 bundle"))?;
+                  let pkey = parsed
+                      .pkey
+                      .ok_or(ServerError::BadBundle("no private key found in PKCS#12 bundle"))?;
+
+                  let mut builder =
+                      SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(ServerError::Tls)?;
+                  builder.set_certificate(&cert).map_err(ServerError::Tls)?;
+                  builder.set_private_key(&pkey).map_err(ServerError::Tls)?;
+                  if let Some(ca) = parsed.ca.as_ref() {
+                      for cert in ca.iter() {
+                          builder
+                              .add_extra_chain_cert(cert.to_owned())
+                              .map_err(ServerError::Tls)?;
+                      }
+                  }
+                  // TLS 1.2 as the floor: every current browser speaks it, and old
+                  // TLS versions are removed from them anyway.
+                  builder
+                      .set_min_proto_version(Some(SslVersion::TLS1_2))
+                      .map_err(ServerError::Tls)?;
+
+                  Ok(OpenSslServer(Arc::new(builder.build())))
+              }
+          }
+
+          impl<T> hyper::net::SslServer<T> for OpenSslServer
+          where
+              T: NetworkStream + Send + Clone + fmt::Debug + Sync,
+          {
+              type Stream = TlsStream<T>;
+
+              fn wrap_server(&self, stream: T) -> hyper::Result<TlsStream<T>> {
+                  match self.0.accept(stream) {
+                      Ok(s) => Ok(TlsStream(Arc::new(Mutex::new(s)))),
+                      Err(e) => {
+                          // Old builds failed silently (clients saw a bare reset with
+                          // nothing on the console); say *something* useful instead.
+                          eprintln!("[tls] handshake failed: {}", e);
+                          Err(hyper::Error::Ssl(Box::new(e)))
+                      }
+                  }
+              }
+          }
+
+          /// An error while creating an `OpenSslServer`.
+          #[derive(Debug)]
+          pub enum ServerError {
+              /// Error reading the .p12 file.
+              Io(io::Error),
+              /// Error parsing the bundle or building the TLS acceptor.
+              Tls(openssl::error::ErrorStack),
+              /// The .p12 parsed, but is missing the certificate or the key.
+              BadBundle(&'static str),
+          }
+
+          impl fmt::Display for ServerError {
+              fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                  match *self {
+                      ServerError::Io(ref e) => write!(f, "error reading identity: {}", e),
+                      ServerError::Tls(ref e) => write!(f, "error initializing TLS acceptor: {}", e),
+                      ServerError::BadBundle(what) => write!(f, "bad PKCS#12 bundle: {}", what),
+                  }
+              }
+          }
+
+          impl StdError for ServerError {
+              fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                  match *self {
+                      ServerError::Io(ref e) => Some(e),
+                      ServerError::Tls(ref e) => Some(e),
+                      ServerError::BadBundle(_) => None,
+                  }
+              }
+          }
+          EOF_TLS_RS
+          cat > vendor/traitobject/Cargo.toml <<'EOF_TRAITOBJECT_TOML'
+          [package]
+
+          name = "traitobject"
+          version = "0.1.0"
+          authors = ["Jonathan Reem <jonathan.reem@gmail.com>"]
+          repository = "https://github.com/reem/rust-traitobject.git"
+          description = "Unsafe helpers for working with raw trait objects."
+          readme = "README.md"
+          license = "MIT/Apache-2.0"
+
+          EOF_TRAITOBJECT_TOML
+          cat > vendor/traitobject/src/lib.rs <<'EOF_TRAITOBJECT_LIB'
+          #![cfg_attr(test, deny(warnings))]
+          #![deny(missing_docs)]
+
+          //! # traitobject
+          //!
+          //! Unsafe helpers for working with raw TraitObjects.
+
+          use std::mem;
+
+          /// Get the data pointer from this trait object.
+          ///
+          /// Highly unsafe, as there is no information about the type of the data.
+          pub unsafe fn data<T: ?Sized>(val: *const T) -> *const () {
+              *mem::transmute::<*const *const T, *const *const ()>(&val)
+          }
+
+          /// Get the data pointer from this trait object, mutably.
+          ///
+          /// Highly unsafe, as there is no information about the type of the data.
+          pub unsafe fn data_mut<T: ?Sized>(mut val: *mut T) -> *mut () {
+              *mem::transmute::<*mut *mut T, *mut *mut ()>(&mut val)
+          }
+
+          #[test]
+          fn test_simple() {
+              let x = &7 as &Send;
+              unsafe { assert!(&7 == mem::transmute::<_, &i32>(data(x))) };
+          }
+
+          /// A trait implemented for all trait objects.
+          ///
+          /// Implementations for all traits in std are provided.
+          pub unsafe trait Trait {}
+
+          mod impls;
+
+          EOF_TRAITOBJECT_LIB
+          cat > vendor/traitobject/src/impls.rs <<'EOF_TRAITOBJECT_IMPLS'
+          use Trait;
+
+          unsafe impl Trait for ::std::any::Any + Send { }
+          unsafe impl Trait for ::std::any::Any + Sync { }
+          unsafe impl Trait for ::std::any::Any + Send + Sync { }
+          unsafe impl<T: ?Sized> Trait for ::std::borrow::Borrow<T> + Send { }
+          unsafe impl<T: ?Sized> Trait for ::std::borrow::Borrow<T> + Sync { }
+          unsafe impl<T: ?Sized> Trait for ::std::borrow::Borrow<T> + Send + Sync { }
+          unsafe impl<T: ?Sized> Trait for ::std::borrow::BorrowMut<T> + Send { }
+          unsafe impl<T: ?Sized> Trait for ::std::borrow::BorrowMut<T> + Sync { }
+          unsafe impl<T: ?Sized> Trait for ::std::borrow::BorrowMut<T> + Send + Sync { }
+          unsafe impl<T: ?Sized> Trait for ::std::convert::AsMut<T> + Send { }
+          unsafe impl<T: ?Sized> Trait for ::std::convert::AsMut<T> + Sync { }
+          unsafe impl<T: ?Sized> Trait for ::std::convert::AsMut<T> + Send + Sync { }
+          unsafe impl<T: ?Sized> Trait for ::std::convert::AsRef<T> + Send { }
+          unsafe impl<T: ?Sized> Trait for ::std::convert::AsRef<T> + Sync { }
+          unsafe impl<T: ?Sized> Trait for ::std::convert::AsRef<T> + Send + Sync { }
+          unsafe impl Trait for ::std::error::Error + Send { }
+          unsafe impl Trait for ::std::error::Error + Sync { }
+          unsafe impl Trait for ::std::error::Error + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::Binary + Send { }
+          unsafe impl Trait for ::std::fmt::Binary + Sync { }
+          unsafe impl Trait for ::std::fmt::Binary + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::Debug + Send { }
+          unsafe impl Trait for ::std::fmt::Debug + Sync { }
+          unsafe impl Trait for ::std::fmt::Debug + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::Display + Send { }
+          unsafe impl Trait for ::std::fmt::Display + Sync { }
+          unsafe impl Trait for ::std::fmt::Display + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::LowerExp + Send { }
+          unsafe impl Trait for ::std::fmt::LowerExp + Sync { }
+          unsafe impl Trait for ::std::fmt::LowerExp + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::LowerHex + Send { }
+          unsafe impl Trait for ::std::fmt::LowerHex + Sync { }
+          unsafe impl Trait for ::std::fmt::LowerHex + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::Octal + Send { }
+          unsafe impl Trait for ::std::fmt::Octal + Sync { }
+          unsafe impl Trait for ::std::fmt::Octal + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::Pointer + Send { }
+          unsafe impl Trait for ::std::fmt::Pointer + Sync { }
+          unsafe impl Trait for ::std::fmt::Pointer + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::UpperExp + Send { }
+          unsafe impl Trait for ::std::fmt::UpperExp + Sync { }
+          unsafe impl Trait for ::std::fmt::UpperExp + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::UpperHex + Send { }
+          unsafe impl Trait for ::std::fmt::UpperHex + Sync { }
+          unsafe impl Trait for ::std::fmt::UpperHex + Send + Sync { }
+          unsafe impl Trait for ::std::fmt::Write + Send { }
+          unsafe impl Trait for ::std::fmt::Write + Sync { }
+          unsafe impl Trait for ::std::fmt::Write + Send + Sync { }
+          unsafe impl Trait for ::std::hash::Hasher + Send { }
+          unsafe impl Trait for ::std::hash::Hasher + Sync { }
+          unsafe impl Trait for ::std::hash::Hasher + Send + Sync { }
+          unsafe impl Trait for ::std::io::BufRead + Send { }
+          unsafe impl Trait for ::std::io::BufRead + Sync { }
+          unsafe impl Trait for ::std::io::BufRead + Send + Sync { }
+          unsafe impl Trait for ::std::io::Read + Send { }
+          unsafe impl Trait for ::std::io::Read + Sync { }
+          unsafe impl Trait for ::std::io::Read + Send + Sync { }
+          unsafe impl Trait for ::std::io::Seek + Send { }
+          unsafe impl Trait for ::std::io::Seek + Sync { }
+          unsafe impl Trait for ::std::io::Seek + Send + Sync { }
+          unsafe impl Trait for ::std::io::Write + Send { }
+          unsafe impl Trait for ::std::io::Write + Sync { }
+          unsafe impl Trait for ::std::io::Write + Send + Sync { }
+          unsafe impl<T, I> Trait for ::std::iter::IntoIterator<IntoIter=I, Item=T> { }
+          unsafe impl<T> Trait for ::std::iter::Iterator<Item=T> + Send { }
+          unsafe impl<T> Trait for ::std::iter::Iterator<Item=T> + Sync { }
+          unsafe impl<T> Trait for ::std::iter::Iterator<Item=T> + Send + Sync { }
+          // Patched for modern rustc: `dyn Send + Send + Sync` etc. now normalize to
+          // `dyn Send + Sync`, which made these six impls collapse into duplicates
+          // (E0119). Keep exactly the three distinct trait-object types.
+          unsafe impl Trait for ::std::marker::Send { }
+          unsafe impl Trait for ::std::marker::Sync { }
+          unsafe impl Trait for ::std::marker::Send + Sync { }
+          unsafe impl Trait for ::std::ops::Drop + Send { }
+          unsafe impl Trait for ::std::ops::Drop + Sync { }
+          unsafe impl Trait for ::std::ops::Drop + Send + Sync { }
+          unsafe impl Trait for ::std::string::ToString + Send { }
+          unsafe impl Trait for ::std::string::ToString + Sync { }
+          unsafe impl Trait for ::std::string::ToString + Send + Sync { }
+
+          EOF_TRAITOBJECT_IMPLS
+          cat > Cargo.lock <<'EOF_CARGO_LOCK'
+          # This file is automatically @generated by Cargo.
+          # It is not intended for manual editing.
+          version = 4
+
+          [[package]]
+          name = "adler"
+          version = "0.2.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ee2a4ec343196209d6594e19543ae87a39f96d5534d7174822a3ad825dd6ed7e"
+
+          [[package]]
+          name = "aho-corasick"
+          version = "0.7.13"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "043164d8ba5c4c3035fec9bbee8647c0261d788f3474306f93bb65901cae0e86"
+          dependencies = [
+           "memchr",
+          ]
+
+          [[package]]
+          name = "ansi_term"
+          version = "0.11.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ee49baf6cb617b853aa8d93bf420db2383fab46d314482ca2803b40d5fde979b"
+          dependencies = [
+           "winapi",
+          ]
+
+          [[package]]
+          name = "ascii"
+          version = "0.8.7"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "97be891acc47ca214468e09425d02cef3af2c94d0d82081cd02061f996802f14"
+
+          [[package]]
+          name = "atty"
+          version = "0.2.14"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "d9b39be18770d11421cdb1b9947a45dd3f37e93092cbf377614828a319d5fee8"
+          dependencies = [
+           "hermit-abi",
+           "libc",
+           "winapi",
+          ]
+
+          [[package]]
+          name = "autocfg"
+          version = "0.1.7"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "1d49d90015b3c36167a20fe2810c5cd875ad504b39cff3d4eae7977e6b7c1cb2"
+
+          [[package]]
+          name = "autocfg"
+          version = "1.0.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "f8aac770f1885fd7e387acedd76065302551364496e46b3dd00860b2f8359b9d"
+
+          [[package]]
+          name = "base64"
+          version = "0.9.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "489d6c0ed21b11d038c31b6ceccca973e65d73ba3bd8ecb9a2babf5546164643"
+          dependencies = [
+           "byteorder",
+           "safemem",
+          ]
+
+          [[package]]
+          name = "bitflags"
+          version = "1.2.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
+
+          [[package]]
+          name = "bitflags"
+          version = "2.13.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+
+          [[package]]
+          name = "buf_redux"
+          version = "0.8.4"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "b953a6887648bb07a535631f2bc00fbdb2a2216f135552cb3f534ed136b9c07f"
+          dependencies = [
+           "memchr",
+           "safemem",
+          ]
+
+          [[package]]
+          name = "byteorder"
+          version = "1.3.4"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "08c48aae112d48ed9f069b33538ea9e3e90aa263cfa3d1c24309612b1f7472de"
+
+          [[package]]
+          name = "cc"
+          version = "1.11.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155"
+          dependencies = [
+           "find-msvc-tools",
+           "shlex",
+          ]
+
+          [[package]]
+          name = "cfg-if"
+          version = "0.1.10"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "4785bdd1c96b2a846b2bd7cc02e86b6b3dbf14e7e53446c4f54c92a361040822"
+
+          [[package]]
+          name = "cfg-if"
+          version = "1.0.5"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+          [[package]]
+          name = "chrono"
+          version = "0.4.13"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "c74d84029116787153e02106bf53e66828452a4b325cc8652b788b5967c0a0b6"
+          dependencies = [
+           "num-integer",
+           "num-traits",
+           "time",
+          ]
+
+          [[package]]
+          name = "chunked_transfer"
+          version = "0.3.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "498d20a7aaf62625b9bf26e637cf7736417cde1d0c99f1d04d1170229a85cf87"
+
+          [[package]]
+          name = "clap"
+          version = "2.33.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "bdfa80d47f954d53a35a64987ca1422f495b8d6483c0fe9f7117b36c2a792129"
+          dependencies = [
+           "ansi_term",
+           "atty",
+           "bitflags 1.2.1",
+           "strsim",
+           "textwrap",
+           "unicode-width",
+           "vec_map",
+          ]
+
+          [[package]]
+          name = "cloudabi"
+          version = "0.0.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ddfc5b9aa5d4507acaf872de71051dfd0e309860e88966e1051e462a077aac4f"
+          dependencies = [
+           "bitflags 1.2.1",
+          ]
+
+          [[package]]
+          name = "crc32fast"
+          version = "1.2.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ba125de2af0df55319f41944744ad91c71113bf74a4646efff39afe1f6842db1"
+          dependencies = [
+           "cfg-if 0.1.10",
+          ]
+
+          [[package]]
+          name = "filetime"
+          version = "0.2.10"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "affc17579b132fc2461adf7c575cc6e8b134ebca52c51f5411388965227dc695"
+          dependencies = [
+           "cfg-if 0.1.10",
+           "libc",
+           "redox_syscall",
+           "winapi",
+          ]
+
+          [[package]]
+          name = "find-msvc-tools"
+          version = "0.1.15"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+          [[package]]
+          name = "flate2"
+          version = "1.0.16"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "68c90b0fc46cf89d227cc78b40e494ff81287a92dd07631e5af0d06fe3cf885e"
+          dependencies = [
+           "cfg-if 0.1.10",
+           "crc32fast",
+           "libc",
+           "miniz_oxide",
+          ]
+
+          [[package]]
+          name = "foreign-types"
+          version = "0.3.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "f6f339eb8adc052cd2ca78910fda869aefa38d22d5cb648e6485e4d3fc06f3b1"
+          dependencies = [
+           "foreign-types-shared",
+          ]
+
+          [[package]]
+          name = "foreign-types-shared"
+          version = "0.1.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
+
+          [[package]]
+          name = "fuchsia-cprng"
+          version = "0.1.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "a06f77d526c1a601b7c4cdd98f54b5eaabffc14d5f2f0296febdc7f357c6d3ba"
+
+          [[package]]
+          name = "getopts"
+          version = "0.2.21"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "14dbbfd5c71d70241ecf9e6f13737f7b5ce823821063188d7e46c41d371eebd5"
+          dependencies = [
+           "unicode-width",
+          ]
+
+          [[package]]
+          name = "getrandom"
+          version = "0.1.14"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "7abc8dd8451921606d809ba32e95b6111925cd2906060d2dcc29c070220503eb"
+          dependencies = [
+           "cfg-if 0.1.10",
+           "libc",
+           "wasi",
+          ]
+
+          [[package]]
+          name = "groupable"
+          version = "0.2.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "32619942b8be646939eaf3db0602b39f5229b74575b67efc897811ded1db4e57"
+
+          [[package]]
+          name = "hermit-abi"
+          version = "0.1.15"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "3deed196b6e7f9e44a2ae8d94225d80302d81208b1bb673fd21fe634645c85a9"
+          dependencies = [
+           "libc",
+          ]
+
+          [[package]]
+          name = "htmlescape"
+          version = "0.3.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "e9025058dae765dee5070ec375f591e2ba14638c63feff74f13805a72e523163"
+
+          [[package]]
+          name = "httparse"
+          version = "1.3.4"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "cd179ae861f0c2e53da70d892f5f3029f9594be0c41dc5269cd371691b1dc2f9"
+
+          [[package]]
+          name = "hyper"
+          version = "0.10.16"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "0a0652d9a2609a968c14be1a9ea00bf4b1d64e2e1f53a1b51b6fff3a6e829273"
+          dependencies = [
+           "base64",
+           "httparse",
+           "language-tags",
+           "log 0.3.9",
+           "mime 0.2.6",
+           "num_cpus",
+           "time",
+           "traitobject",
+           "typeable",
+           "unicase 1.4.2",
+           "url 1.7.2",
+          ]
+
+          [[package]]
+          name = "idna"
+          version = "0.1.5"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "38f09e0f0b1fb55fdee1f17470ad800da77af5186a1a76c026b679358b7e844e"
+          dependencies = [
+           "matches",
+           "unicode-bidi",
+           "unicode-normalization",
+          ]
+
+          [[package]]
+          name = "idna"
+          version = "0.2.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "02e2673c30ee86b5b96a9cb52ad15718aa1f966f5ab9ad54a8b95d5ca33120a9"
+          dependencies = [
+           "matches",
+           "unicode-bidi",
+           "unicode-normalization",
+          ]
+
+          [[package]]
+          name = "iron"
+          version = "0.6.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "c6d308ca2d884650a8bf9ed2ff4cb13fbb2207b71f64cda11dc9b892067295e8"
+          dependencies = [
+           "hyper",
+           "log 0.3.9",
+           "mime_guess 1.8.8",
+           "modifier",
+           "num_cpus",
+           "plugin",
+           "typemap",
+           "url 1.7.2",
+          ]
+
+          [[package]]
+          name = "iron-cors"
+          version = "0.8.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "24b02b8856c7f14e443c483e802cf0ce693f3bec19f49d2c9a242b18f88c9b70"
+          dependencies = [
+           "iron",
+           "log 0.4.11",
+          ]
+
+          [[package]]
+          name = "itoa"
+          version = "0.4.6"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "dc6f3ad7b9d11a0c00842ff8de1b60ee58661048eb8049ed33c73594f359d7e6"
+
+          [[package]]
+          name = "language-tags"
+          version = "0.2.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "a91d884b6667cd606bb5a69aa0c99ba811a115fc68915e7056ec08a46e93199a"
+
+          [[package]]
+          name = "lazy_static"
+          version = "1.4.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
+
+          [[package]]
+          name = "libc"
+          version = "0.2.72"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "a9f8082297d534141b30c8d39e9b1773713ab50fdbe4ff30f750d063b3bfd701"
+
+          [[package]]
+          name = "log"
+          version = "0.3.9"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
+          dependencies = [
+           "log 0.4.11",
+          ]
+
+          [[package]]
+          name = "log"
+          version = "0.4.11"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "4fabed175da42fed1fa0746b0ea71f412aa9d35e76e95e59b192c64b9dc2bf8b"
+          dependencies = [
+           "cfg-if 0.1.10",
+          ]
+
+          [[package]]
+          name = "matches"
+          version = "0.1.8"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "7ffc5c5338469d4d3ea17d269fa8ea3512ad247247c30bd2df69e68309ed0a08"
+
+          [[package]]
+          name = "memchr"
+          version = "2.3.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "3728d817d99e5ac407411fa471ff9800a778d88a24685968b36824eaf4bee400"
+
+          [[package]]
+          name = "mime"
+          version = "0.2.6"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ba626b8a6de5da682e1caa06bdb42a335aee5a84db8e5046a3e8ab17ba0a3ae0"
+          dependencies = [
+           "log 0.3.9",
+          ]
+
+          [[package]]
+          name = "mime"
+          version = "0.3.16"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "2a60c7ce501c71e03a9c9c0d35b861413ae925bd979cc7a4e30d060069aaac8d"
+
+          [[package]]
+          name = "mime_guess"
+          version = "1.8.8"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "216929a5ee4dd316b1702eedf5e74548c123d370f47841ceaac38ca154690ca3"
+          dependencies = [
+           "mime 0.2.6",
+           "phf",
+           "phf_codegen",
+           "unicase 1.4.2",
+          ]
+
+          [[package]]
+          name = "mime_guess"
+          version = "2.0.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "2684d4c2e97d99848d30b324b00c8fcc7e5c897b7cbb5819b09e7c90e8baf212"
+          dependencies = [
+           "mime 0.3.16",
+           "unicase 2.6.0",
+          ]
+
+          [[package]]
+          name = "miniz_oxide"
+          version = "0.4.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "be0f75932c1f6cfae3c04000e40114adf955636e19040f9c0a2c380702aa1c7f"
+          dependencies = [
+           "adler",
+          ]
+
+          [[package]]
+          name = "modifier"
+          version = "0.1.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "41f5c9112cb662acd3b204077e0de5bc66305fa8df65c8019d5adb10e9ab6e58"
+
+          [[package]]
+          name = "multipart"
+          version = "0.16.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "136eed74cadb9edd2651ffba732b19a450316b680e4f48d6c79e905799e19d01"
+          dependencies = [
+           "buf_redux",
+           "httparse",
+           "hyper",
+           "iron",
+           "log 0.4.11",
+           "mime 0.2.6",
+           "mime_guess 1.8.8",
+           "nickel",
+           "quick-error",
+           "rand 0.6.5",
+           "safemem",
+           "tempfile",
+           "tiny_http",
+           "twoway",
+          ]
+
+          [[package]]
+          name = "mustache"
+          version = "0.9.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "51956ef1c5d20a1384524d91e616fb44dfc7d8f249bf696d49c97dd3289ecab5"
+          dependencies = [
+           "log 0.3.9",
+           "serde",
+          ]
+
+          [[package]]
+          name = "nickel"
+          version = "0.11.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "e5061a832728db2dacb61cefe0ce303b58f85764ec680e71d9138229640a46d9"
+          dependencies = [
+           "groupable",
+           "hyper",
+           "lazy_static",
+           "log 0.3.9",
+           "modifier",
+           "mustache",
+           "plugin",
+           "regex",
+           "serde",
+           "serde_json",
+           "time",
+           "typemap",
+           "url 1.7.2",
+          ]
+
+          [[package]]
+          name = "num-integer"
+          version = "0.1.43"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "8d59457e662d541ba17869cf51cf177c0b5f0cbf476c66bdc90bf1edac4f875b"
+          dependencies = [
+           "autocfg 1.0.0",
+           "num-traits",
+          ]
+
+          [[package]]
+          name = "num-traits"
+          version = "0.2.12"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ac267bcc07f48ee5f8935ab0d24f316fb722d7a1292e2913f0cc196b29ffd611"
+          dependencies = [
+           "autocfg 1.0.0",
+          ]
+
+          [[package]]
+          name = "num_cpus"
+          version = "1.13.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "05499f3756671c15885fee9034446956fff3f243d6077b91e5767df161f766b3"
+          dependencies = [
+           "hermit-abi",
+           "libc",
+          ]
+
+          [[package]]
+          name = "once_cell"
+          version = "1.21.4"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+          [[package]]
+          name = "open"
+          version = "1.4.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "7c283bf0114efea9e42f1a60edea9859e8c47528eae09d01df4b29c1e489cc48"
+          dependencies = [
+           "winapi",
+          ]
+
+          [[package]]
+          name = "openssl"
+          version = "0.10.76"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "951c002c75e16ea2c65b8c7e4d3d51d5530d8dfa7d060b4776828c88cfb18ecf"
+          dependencies = [
+           "bitflags 2.13.2",
+           "cfg-if 1.0.5",
+           "foreign-types",
+           "libc",
+           "once_cell",
+           "openssl-macros",
+           "openssl-sys",
+          ]
+
+          [[package]]
+          name = "openssl-macros"
+          version = "0.1.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
+          dependencies = [
+           "proc-macro2",
+           "quote",
+           "syn",
+          ]
+
+          [[package]]
+          name = "openssl-src"
+          version = "300.6.1+3.6.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "46eb8fb9fb3b61ce1c0f8a026c4c1a0714d3a9e138e7fbde78753ce2babc3846"
+          dependencies = [
+           "cc",
+          ]
+
+          [[package]]
+          name = "openssl-sys"
+          version = "0.9.118"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "19c413d6ec9ebaf5e1c829d355cb3e9f783778d700f135be0921d52fce3c60ae"
+          dependencies = [
+           "cc",
+           "libc",
+           "openssl-src",
+           "pkg-config",
+           "vcpkg",
+          ]
+
+          [[package]]
+          name = "path-dedot"
+          version = "1.2.4"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "45c58ab1edb03f77d0bb3f08e4a179dd43ce9bc8eab9867ec53a78285ea3039b"
+          dependencies = [
+           "lazy_static",
+          ]
+
+          [[package]]
+          name = "percent-encoding"
+          version = "1.0.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "31010dd2e1ac33d5b46a5b413495239882813e0369f8ed8a5e266f173602f831"
+
+          [[package]]
+          name = "percent-encoding"
+          version = "2.1.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "d4fd5641d01c8f18a23da7b6fe29298ff4b55afcccdf78973b24cf3175fee32e"
+
+          [[package]]
+          name = "phf"
+          version = "0.7.24"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "b3da44b85f8e8dfaec21adae67f95d93244b2ecf6ad2a692320598dcc8e6dd18"
+          dependencies = [
+           "phf_shared",
+          ]
+
+          [[package]]
+          name = "phf_codegen"
+          version = "0.7.24"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "b03e85129e324ad4166b06b2c7491ae27fe3ec353af72e72cd1654c7225d517e"
+          dependencies = [
+           "phf_generator",
+           "phf_shared",
+          ]
+
+          [[package]]
+          name = "phf_generator"
+          version = "0.7.24"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "09364cc93c159b8b06b1f4dd8a4398984503483891b0c26b867cf431fb132662"
+          dependencies = [
+           "phf_shared",
+           "rand 0.6.5",
+          ]
+
+          [[package]]
+          name = "phf_shared"
+          version = "0.7.24"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "234f71a15de2288bcb7e3b6515828d22af7ec8598ee6d24c3b526fa0a80b67a0"
+          dependencies = [
+           "siphasher",
+           "unicase 1.4.2",
+          ]
+
+          [[package]]
+          name = "pkg-config"
+          version = "0.3.18"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "d36492546b6af1463394d46f0c834346f31548646f6ba10849802c9c9a27ac33"
+
+          [[package]]
+          name = "plugin"
+          version = "0.2.6"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "1a6a0dc3910bc8db877ffed8e457763b317cf880df4ae19109b9f77d277cf6e0"
+          dependencies = [
+           "typemap",
+          ]
+
+          [[package]]
+          name = "ppv-lite86"
+          version = "0.2.8"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "237a5ed80e274dbc66f86bd59c1e25edc039660be53194b5fe0a482e0f2612ea"
+
+          [[package]]
+          name = "pretty-bytes"
+          version = "0.2.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "009d6edd2c1dbf2e1c0cd48a2f7766e03498d49ada7109a01c6911815c685316"
+          dependencies = [
+           "atty",
+           "getopts",
+          ]
+
+          [[package]]
+          name = "proc-macro2"
+          version = "1.0.107"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
+          dependencies = [
+           "unicode-ident",
+          ]
+
+          [[package]]
+          name = "quick-error"
+          version = "1.2.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
+
+          [[package]]
+          name = "quote"
+          version = "1.0.47"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+          dependencies = [
+           "proc-macro2",
+          ]
+
+          [[package]]
+          name = "rand"
+          version = "0.6.5"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "6d71dacdc3c88c1fde3885a3be3fbab9f35724e6ce99467f7d9c5026132184ca"
+          dependencies = [
+           "autocfg 0.1.7",
+           "libc",
+           "rand_chacha 0.1.1",
+           "rand_core 0.4.2",
+           "rand_hc 0.1.0",
+           "rand_isaac",
+           "rand_jitter",
+           "rand_os",
+           "rand_pcg",
+           "rand_xorshift",
+           "winapi",
+          ]
+
+          [[package]]
+          name = "rand"
+          version = "0.7.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "6a6b1679d49b24bbfe0c803429aa1874472f50d9b363131f0e89fc356b544d03"
+          dependencies = [
+           "getrandom",
+           "libc",
+           "rand_chacha 0.2.2",
+           "rand_core 0.5.1",
+           "rand_hc 0.2.0",
+          ]
+
+          [[package]]
+          name = "rand_chacha"
+          version = "0.1.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "556d3a1ca6600bfcbab7c7c91ccb085ac7fbbcd70e008a98742e7847f4f7bcef"
+          dependencies = [
+           "autocfg 0.1.7",
+           "rand_core 0.3.1",
+          ]
+
+          [[package]]
+          name = "rand_chacha"
+          version = "0.2.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "f4c8ed856279c9737206bf725bf36935d8666ead7aa69b52be55af369d193402"
+          dependencies = [
+           "ppv-lite86",
+           "rand_core 0.5.1",
+          ]
+
+          [[package]]
+          name = "rand_core"
+          version = "0.3.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "7a6fdeb83b075e8266dcc8762c22776f6877a63111121f5f8c7411e5be7eed4b"
+          dependencies = [
+           "rand_core 0.4.2",
+          ]
+
+          [[package]]
+          name = "rand_core"
+          version = "0.4.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "9c33a3c44ca05fa6f1807d8e6743f3824e8509beca625669633be0acbdf509dc"
+
+          [[package]]
+          name = "rand_core"
+          version = "0.5.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "90bde5296fc891b0cef12a6d03ddccc162ce7b2aff54160af9338f8d40df6d19"
+          dependencies = [
+           "getrandom",
+          ]
+
+          [[package]]
+          name = "rand_hc"
+          version = "0.1.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "7b40677c7be09ae76218dc623efbf7b18e34bced3f38883af07bb75630a21bc4"
+          dependencies = [
+           "rand_core 0.3.1",
+          ]
+
+          [[package]]
+          name = "rand_hc"
+          version = "0.2.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ca3129af7b92a17112d59ad498c6f81eaf463253766b90396d39ea7a39d6613c"
+          dependencies = [
+           "rand_core 0.5.1",
+          ]
+
+          [[package]]
+          name = "rand_isaac"
+          version = "0.1.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ded997c9d5f13925be2a6fd7e66bf1872597f759fd9dd93513dd7e92e5a5ee08"
+          dependencies = [
+           "rand_core 0.3.1",
+          ]
+
+          [[package]]
+          name = "rand_jitter"
+          version = "0.1.4"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "1166d5c91dc97b88d1decc3285bb0a99ed84b05cfd0bc2341bdf2d43fc41e39b"
+          dependencies = [
+           "libc",
+           "rand_core 0.4.2",
+           "winapi",
+          ]
+
+          [[package]]
+          name = "rand_os"
+          version = "0.1.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "7b75f676a1e053fc562eafbb47838d67c84801e38fc1ba459e8f180deabd5071"
+          dependencies = [
+           "cloudabi",
+           "fuchsia-cprng",
+           "libc",
+           "rand_core 0.4.2",
+           "rdrand",
+           "winapi",
+          ]
+
+          [[package]]
+          name = "rand_pcg"
+          version = "0.1.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "abf9b09b01790cfe0364f52bf32995ea3c39f4d2dd011eac241d2914146d0b44"
+          dependencies = [
+           "autocfg 0.1.7",
+           "rand_core 0.4.2",
+          ]
+
+          [[package]]
+          name = "rand_xorshift"
+          version = "0.1.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "cbf7e9e623549b0e21f6e97cf8ecf247c1a8fd2e8a992ae265314300b2455d5c"
+          dependencies = [
+           "rand_core 0.3.1",
+          ]
+
+          [[package]]
+          name = "rdrand"
+          version = "0.4.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "678054eb77286b51581ba43620cc911abf02758c91f93f479767aed0f90458b2"
+          dependencies = [
+           "rand_core 0.3.1",
+          ]
+
+          [[package]]
+          name = "redox_syscall"
+          version = "0.1.57"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "41cc0f7e4d5d4544e8861606a285bb08d3e70712ccc7d2b84d7c0ccfaf4b05ce"
+
+          [[package]]
+          name = "regex"
+          version = "1.3.9"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "9c3780fcf44b193bc4d09f36d2a3c87b251da4a046c87795a0d35f4f927ad8e6"
+          dependencies = [
+           "aho-corasick",
+           "memchr",
+           "regex-syntax",
+           "thread_local",
+          ]
+
+          [[package]]
+          name = "regex-syntax"
+          version = "0.6.18"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "26412eb97c6b088a6997e05f69403a802a92d520de2f8e63c2b65f9e0f47c4e8"
+
+          [[package]]
+          name = "remove_dir_all"
+          version = "0.5.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "3acd125665422973a33ac9d3dd2df85edad0f4ae9b00dafb1a05e43a9f5ef8e7"
+          dependencies = [
+           "winapi",
+          ]
+
+          [[package]]
+          name = "ryu"
+          version = "1.0.5"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "71d301d4193d031abdd79ff7e3dd721168a9572ef3fe51a1517aba235bd8f86e"
+
+          [[package]]
+          name = "safemem"
+          version = "0.3.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ef703b7cb59335eae2eb93ceb664c0eb7ea6bf567079d843e09420219668e072"
+
+          [[package]]
+          name = "serde"
+          version = "1.0.114"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "5317f7588f0a5078ee60ef675ef96735a1442132dc645eb1d12c018620ed8cd3"
+
+          [[package]]
+          name = "serde_json"
+          version = "1.0.56"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "3433e879a558dde8b5e8feb2a04899cf34fdde1fafb894687e52105fc1162ac3"
+          dependencies = [
+           "itoa",
+           "ryu",
+           "serde",
+          ]
+
+          [[package]]
+          name = "shlex"
+          version = "2.0.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+          [[package]]
+          name = "simple-http-server"
+          version = "0.6.1"
+          dependencies = [
+           "chrono",
+           "clap",
+           "filetime",
+           "flate2",
+           "htmlescape",
+           "hyper",
+           "iron",
+           "iron-cors",
+           "lazy_static",
+           "mime_guess 2.0.3",
+           "multipart",
+           "open",
+           "openssl",
+           "path-dedot",
+           "percent-encoding 2.1.0",
+           "pretty-bytes",
+           "termcolor",
+           "time",
+           "url 2.1.1",
+          ]
+
+          [[package]]
+          name = "siphasher"
+          version = "0.2.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "0b8de496cf83d4ed58b6be86c3a275b8602f6ffe98d3024a869e124147a9a3ac"
+
+          [[package]]
+          name = "strsim"
+          version = "0.8.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "8ea5119cdb4c55b55d432abb513a0429384878c15dde60cc77b1c99de1a95a6a"
+
+          [[package]]
+          name = "syn"
+          version = "2.0.119"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+          dependencies = [
+           "proc-macro2",
+           "quote",
+           "unicode-ident",
+          ]
+
+          [[package]]
+          name = "tempfile"
+          version = "3.1.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "7a6e24d9338a0a5be79593e2fa15a648add6138caa803e2d5bc782c371732ca9"
+          dependencies = [
+           "cfg-if 0.1.10",
+           "libc",
+           "rand 0.7.3",
+           "redox_syscall",
+           "remove_dir_all",
+           "winapi",
+          ]
+
+          [[package]]
+          name = "termcolor"
+          version = "1.1.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "bb6bfa289a4d7c5766392812c0a1f4c1ba45afa1ad47803c11e1f407d846d75f"
+          dependencies = [
+           "winapi-util",
+          ]
+
+          [[package]]
+          name = "textwrap"
+          version = "0.11.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "d326610f408c7a4eb6f51c37c330e496b08506c9457c9d34287ecc38809fb060"
+          dependencies = [
+           "unicode-width",
+          ]
+
+          [[package]]
+          name = "thread_local"
+          version = "1.0.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "d40c6d1b69745a6ec6fb1ca717914848da4b44ae29d9b3080cbee91d72a69b14"
+          dependencies = [
+           "lazy_static",
+          ]
+
+          [[package]]
+          name = "time"
+          version = "0.1.43"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ca8a50ef2360fbd1eeb0ecd46795a87a19024eb4b53c5dc916ca1fd95fe62438"
+          dependencies = [
+           "libc",
+           "winapi",
+          ]
+
+          [[package]]
+          name = "tiny_http"
+          version = "0.6.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "1661fa0a44c95d01604bd05c66732a446c657efb62b5164a7a083a3b552b4951"
+          dependencies = [
+           "ascii",
+           "chrono",
+           "chunked_transfer",
+           "log 0.4.11",
+           "url 1.7.2",
+          ]
+
+          [[package]]
+          name = "tinyvec"
+          version = "0.3.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "53953d2d3a5ad81d9f844a32f14ebb121f50b650cd59d0ee2a07cf13c617efed"
+
+          [[package]]
+          name = "traitobject"
+          version = "0.1.0"
+
+          [[package]]
+          name = "twoway"
+          version = "0.1.8"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "59b11b2b5241ba34be09c3cc85a36e56e48f9888862e19cedf23336d35316ed1"
+          dependencies = [
+           "memchr",
+          ]
+
+          [[package]]
+          name = "typeable"
+          version = "0.1.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "1410f6f91f21d1612654e7cc69193b0334f909dcf2c790c4826254fbb86f8887"
+
+          [[package]]
+          name = "typemap"
+          version = "0.3.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "653be63c80a3296da5551e1bfd2cca35227e13cdd08c6668903ae2f4f77aa1f6"
+          dependencies = [
+           "unsafe-any",
+          ]
+
+          [[package]]
+          name = "unicase"
+          version = "1.4.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "7f4765f83163b74f957c797ad9253caf97f103fb064d3999aea9568d09fc8a33"
+          dependencies = [
+           "version_check 0.1.5",
+          ]
+
+          [[package]]
+          name = "unicase"
+          version = "2.6.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "50f37be617794602aabbeee0be4f259dc1778fabe05e2d67ee8f79326d5cb4f6"
+          dependencies = [
+           "version_check 0.9.2",
+          ]
+
+          [[package]]
+          name = "unicode-bidi"
+          version = "0.3.4"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "49f2bd0c6468a8230e1db229cff8029217cf623c767ea5d60bfbd42729ea54d5"
+          dependencies = [
+           "matches",
+          ]
+
+          [[package]]
+          name = "unicode-ident"
+          version = "1.0.27"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+          [[package]]
+          name = "unicode-normalization"
+          version = "0.1.13"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "6fb19cf769fa8c6a80a162df694621ebeb4dafb606470b2b2fce0be40a98a977"
+          dependencies = [
+           "tinyvec",
+          ]
+
+          [[package]]
+          name = "unicode-width"
+          version = "0.1.8"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "9337591893a19b88d8d87f2cec1e73fad5cdfd10e5a6f349f498ad6ea2ffb1e3"
+
+          [[package]]
+          name = "unsafe-any"
+          version = "0.4.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "f30360d7979f5e9c6e6cea48af192ea8fab4afb3cf72597154b8f08935bc9c7f"
+          dependencies = [
+           "traitobject",
+          ]
+
+          [[package]]
+          name = "url"
+          version = "1.7.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "dd4e7c0d531266369519a4aa4f399d748bd37043b00bde1e4ff1f60a120b355a"
+          dependencies = [
+           "idna 0.1.5",
+           "matches",
+           "percent-encoding 1.0.1",
+          ]
+
+          [[package]]
+          name = "url"
+          version = "2.1.1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "829d4a8476c35c9bf0bbce5a3b23f4106f79728039b726d292bb93bc106787cb"
+          dependencies = [
+           "idna 0.2.0",
+           "matches",
+           "percent-encoding 2.1.0",
+          ]
+
+          [[package]]
+          name = "vcpkg"
+          version = "0.2.10"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "6454029bf181f092ad1b853286f23e2c507d8e8194d01d92da4a55c274a5508c"
+
+          [[package]]
+          name = "vec_map"
+          version = "0.8.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
+
+          [[package]]
+          name = "version_check"
+          version = "0.1.5"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "914b1a6776c4c929a602fafd8bc742e06365d4bcbe48c30f9cca5824f70dc9dd"
+
+          [[package]]
+          name = "version_check"
+          version = "0.9.2"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "b5a972e5669d67ba988ce3dc826706fb0a8b01471c088cb0b6110b805cc36aed"
+
+          [[package]]
+          name = "wasi"
+          version = "0.9.0+wasi-snapshot-preview1"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "cccddf32554fecc6acb585f82a32a72e28b48f8c4c1883ddfeeeaa96f7d8e519"
+
+          [[package]]
+          name = "winapi"
+          version = "0.3.9"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+          dependencies = [
+           "winapi-i686-pc-windows-gnu",
+           "winapi-x86_64-pc-windows-gnu",
+          ]
+
+          [[package]]
+          name = "winapi-i686-pc-windows-gnu"
+          version = "0.4.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+          [[package]]
+          name = "winapi-util"
+          version = "0.1.5"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "70ec6ce85bb158151cae5e5c87f95a8e97d2c0c4b001223f33a334e3ce5de178"
+          dependencies = [
+           "winapi",
+          ]
+
+          [[package]]
+          name = "winapi-x86_64-pc-windows-gnu"
+          version = "0.4.0"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+          EOF_CARGO_LOCK
+          echo 'patched files written:'
+          ls -la Cargo.toml src/tls.rs vendor/traitobject/src/impls.rs Cargo.lock
+
+      - name: Patch src/main.rs (swap hyper-native-tls for the OpenSSL acceptor)
+        shell: bash
+        run: |
+          git apply --verbose <<'EOF_MAIN_PATCH'
+          diff --git a/src/main.rs b/src/main.rs
+          index 2e1a35d..1ab4bb0 100644
+          --- a/src/main.rs
+          +++ b/src/main.rs
+          @@ -2,6 +2,9 @@ mod color;
+           mod middlewares;
+           mod util;
+
+          +#[cfg(feature = "tls")]
+          +mod tls;
+          +
+           use std::cmp::Ordering;
+           use std::collections::BTreeMap;
+           use std::env;
+          @@ -348,8 +351,8 @@ fn main() {
+
+               #[cfg(feature = "tls")]
+               let rv = if let Some(cert) = cert {
+          -        use hyper_native_tls::NativeTlsServer;
+          -        let ssl = NativeTlsServer::new(cert, certpass.unwrap_or("")).unwrap();
+          +        let ssl = crate::tls::OpenSslServer::new(cert, certpass.unwrap_or(""))
+          +            .expect("failed to load --cert (PKCS#12 file or --certpass wrong?)");
+                   server.https(&addr, ssl)
+               } else {
+                   server.http(&addr)
+          EOF_MAIN_PATCH
+
+      - name: Build
+        shell: bash
+        run: cargo build --release
+
+      - name: Smoke test (serve HTTPS with a throwaway self-signed p12)
+        shell: bash
+        run: |
+          set -e
+          command -v openssl >/dev/null || { echo '::error::openssl not found in Git Bash'; exit 1; }
+          command -v curl    >/dev/null || { echo '::error::curl not found'; exit 1; }
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$RUNNER_TEMP/k.pem" -out "$RUNNER_TEMP/c.pem" \
+            -days 2 -subj "//CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+          openssl pkcs12 -export -out "$RUNNER_TEMP/t.p12" -inkey "$RUNNER_TEMP/k.pem" -in "$RUNNER_TEMP/c.pem" \
+            -passout pass:test1234 2>/dev/null
+          ./target/release/simple-http-server.exe --cert "$RUNNER_TEMP/t.p12" --certpass test1234 \
+            --ip 127.0.0.1 --port 8444 . &
+          SPID=$!
+          sleep 4
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://127.0.0.1:8444/ || true)
+          kill $SPID 2>/dev/null || true
+          echo "HTTPS smoke test HTTP status: $code"
+          if [ "$code" != "200" ]; then echo "::error::smoke test failed (status $code)"; exit 1; fi
+          echo "Smoke test PASSED: the exe serves HTTPS."
+
+      - name: Write usage note
+        shell: bash
+        run: |
+          cat > USAGE.txt <<'EOF_USAGE'
+          simple-http-server v0.6.1 - OpenSSL TLS build (patched)
+          =======================================================
+
+          This is upstream v0.6.1 with one surgical change: the TLS layer was switched
+          from the platform's native TLS (Schannel on Windows) to OpenSSL, statically
+          linked into this exe. On machines where Schannel's server-side policy rejects
+          what the original 2021-era binary could negotiate, the original exe resets
+          every HTTPS connection; this build does not use Schannel at all.
+
+          The command line is IDENTICAL to the original v0.6.1, e.g.:
+
+              simple-http-server.exe --cert local.p12 --certpass <export-password> --ip 0.0.0.0 --port 8001 <root-dir>
+
+          Notes:
+          - --certpass takes the PKCS#12 EXPORT password (same as always).
+          - TLS 1.2 and 1.3 (the old Windows binaries capped at TLS 1.2).
+          - Failed handshakes now print a one-line reason on the console instead of
+            resetting silently.
+          - Downloaded exes may be flagged by SmartScreen (unsigned build): right-click
+            -> Properties -> Unblock, or "More info" -> "Run anyway" when running.
+          EOF_USAGE
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-http-server-v0.6.1-openssl-windows-x64
+          path: |
+            target/release/simple-http-server.exe
+            USAGE.txt
+          if-no-files-found: error
