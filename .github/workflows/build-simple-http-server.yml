@@ -1,16 +1,28 @@
 # GitHub Actions workflow: build simple-http-server for Windows with
 # working OpenSSL-based TLS - no Rust toolchain needed on your machine.
 #
+# v2 - fixes the first runner attempt (2026-11-23):
+#   1. Build now puts the image's FULL Perl (Strawberry) first on PATH.
+#      Git Bash's bundled Perl lacks core modules (Locale::Maketext::Simple)
+#      and made openssl-src's `perl Configure` die with exit code 2 ->
+#      "error: failed to run custom build command for openssl-sys" (the
+#      only real error in that run; everything before it worked).
+#   2. Smoke tests rewritten in PowerShell with Windows-native tools
+#      (New-SelfSignedCertificate + Export-PfxCertificate + curl.exe):
+#      no dependency on Git Bash's openssl/curl anymore.
+#
 # WEB-ONLY USAGE (no CLI, no local build tools):
 #   1. Fork https://github.com/thewawar/simple-http-server (button, top right).
 #   2. In YOUR fork (github.com/<you>/simple-http-server):
 #      "Add file" -> "Create new file" ->
 #      name it:  .github/workflows/build-simple-http-server.yml
 #      paste this whole file as the content -> "Commit changes".
+#      (If you already added the v1 file: open it in your fork, click the
+#      pencil icon, select all, paste this file's content, commit.)
 #   3. Open the "Actions" tab of your fork -> click
 #      "I understand my workflows, go ahead and enable them".
 #   4. Left sidebar: "Build simple-http-server (Windows, TLS via OpenSSL)"
-#      -> "Run workflow" button -> "Run workflow" (branch: main).
+#      -> "Run workflow" button -> "Run workflow" (branch: main / master).
 #   5. Wait ~10-15 min for the green check. Open that run ->
 #      scroll to "Artifacts" at the bottom -> download both zips.
 #      Each zip contains the .exe plus a short USAGE.txt.
@@ -26,6 +38,11 @@
 # The v0.6.1 patch embedded below is exactly the tree that was compiled and
 # runtime-validated end-to-end (TLS 1.3 + HTTP 200 with a two-password
 # PKCS#12, full chain served, SAN mismatch correctly rejected).
+#
+# Build-time notes: OPENSSL_NO_ASM=1 keeps the vendored OpenSSL build free
+# of the NASM requirement; rustc may print bare-trait-object warnings from
+# a vendored 2015-era helper crate - warnings only, they do not fail the
+# build (verified on rustc 1.100.0 in the first runner attempt).
 
 name: Build simple-http-server (Windows, TLS via OpenSSL)
 
@@ -54,29 +71,57 @@ jobs:
         shell: bash
         run: rustup toolchain install stable --profile minimal --no-self-update
 
-      - name: Build
-        shell: bash
-        run: cargo build --release --features tls
-
-      - name: Smoke test (serve HTTPS with a throwaway self-signed p12)
+      - name: Build (with a full Perl on PATH for the vendored OpenSSL)
         shell: bash
         run: |
-          set -e
-          command -v openssl >/dev/null || { echo '::error::openssl not found in Git Bash'; exit 1; }
-          command -v curl    >/dev/null || { echo '::error::curl not found'; exit 1; }
-          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$RUNNER_TEMP/k.pem" -out "$RUNNER_TEMP/c.pem" \
-            -days 2 -subj "//CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
-          openssl pkcs12 -export -out "$RUNNER_TEMP/t.p12" -inkey "$RUNNER_TEMP/k.pem" -in "$RUNNER_TEMP/c.pem" \
-            -passout pass:test1234 2>/dev/null
-          ./target/release/simple-http-server.exe --cert "$RUNNER_TEMP/t.p12" --certpass test1234 \
-            --ip 127.0.0.1 --port 8443 . &
-          SPID=$!
-          sleep 4
-          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ || true)
-          kill $SPID 2>/dev/null || true
-          echo "HTTPS smoke test HTTP status: $code"
-          if [ "$code" != "200" ]; then echo "::error::smoke test failed (status $code)"; exit 1; fi
-          echo "Smoke test PASSED: the exe serves HTTPS."
+          # --- make a full Perl visible for the vendored OpenSSL build -------------
+          # Git Bash's bundled Perl lacks core modules (Locale::Maketext::Simple etc.)
+          # which makes openssl-src's `perl Configure` die with exit code 2.
+          for d in /c/Strawberry/perl/bin /c/Strawberry /c/tools/perl/bin /c/Perl64/bin /c/Perl/bin; do
+            if [ -x "$d/perl.exe" ] && "$d/perl.exe" -MLocale::Maketext::Simple -e 'exit 0' >/dev/null 2>&1; then
+              echo "Using full Perl from: $d"
+              export PATH="$d:$PATH"
+              break
+            fi
+          done
+          if ! perl -MLocale::Maketext::Simple -e 'print "ok\n"' >/dev/null 2>&1; then
+            echo 'No usable Perl found on the image; installing Strawberry Perl via chocolatey...'
+            choco install -y strawberryperl --no-progress
+            export PATH="/c/Strawberry/perl/bin:$PATH"
+          fi
+          perl -MLocale::Maketext::Simple -e 'print "perl ready for vendored OpenSSL\n"' \
+            || { echo '::error::no full Perl available - vendored OpenSSL cannot be configured'; exit 1; }
+          # ---------------------------------------------------------------------------
+          cargo build --release --features tls
+
+      - name: Smoke test (serve HTTPS with a throwaway self-signed p12)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p12 = Join-Path $env:RUNNER_TEMP 'smoke.p12'
+          $cert = New-SelfSignedCertificate -Subject 'CN=localhost' -KeyExportPolicy Exportable -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddDays(2)
+          $pw = ConvertTo-SecureString 'test1234' -AsPlainText -Force
+          Export-PfxCertificate -Cert $cert -FilePath $p12 -Password $pw | Out-Null
+          $exe = Join-Path (Get-Location) 'target\release\simple-http-server.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'smoke-server.log'
+          $p = Start-Process -FilePath $exe -ArgumentList @('--cert', $p12, '--certpass', 'test1234', '--ip', '127.0.0.1', '--port', '8443', '.') -PassThru -NoNewWindow -RedirectStandardOutput $out
+          try {
+            $code = ''
+            for ($i = 0; $i -lt 10 -and $code -ne '200'; $i++) {
+              Start-Sleep -Seconds 1
+              $code = (& curl.exe -k -s -o NUL -w '%{http_code}' https://127.0.0.1:8443/ 2>$null)
+            }
+            Write-Host "HTTPS smoke test HTTP status: $code"
+            if ($code -ne '200') {
+              Write-Host '--- server output so far:'
+              Get-Content $out -ErrorAction SilentlyContinue
+              throw "smoke test failed (status $code)"
+            }
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
+          }
+          Write-Host 'Smoke test PASSED: the exe serves HTTPS.'
 
       - name: Write usage note
         shell: bash
@@ -1727,7 +1772,7 @@ jobs:
         run: |
           git apply --verbose <<'EOF_MAIN_PATCH'
           diff --git a/src/main.rs b/src/main.rs
-          index 2e1a35d..1ab4bb0 100644
+          index 2e1a35d..1ab4bb0 100755
           --- a/src/main.rs
           +++ b/src/main.rs
           @@ -2,6 +2,9 @@ mod color;
@@ -1753,29 +1798,57 @@ jobs:
                    server.http(&addr)
           EOF_MAIN_PATCH
 
-      - name: Build
-        shell: bash
-        run: cargo build --release
-
-      - name: Smoke test (serve HTTPS with a throwaway self-signed p12)
+      - name: Build (with a full Perl on PATH for the vendored OpenSSL)
         shell: bash
         run: |
-          set -e
-          command -v openssl >/dev/null || { echo '::error::openssl not found in Git Bash'; exit 1; }
-          command -v curl    >/dev/null || { echo '::error::curl not found'; exit 1; }
-          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$RUNNER_TEMP/k.pem" -out "$RUNNER_TEMP/c.pem" \
-            -days 2 -subj "//CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
-          openssl pkcs12 -export -out "$RUNNER_TEMP/t.p12" -inkey "$RUNNER_TEMP/k.pem" -in "$RUNNER_TEMP/c.pem" \
-            -passout pass:test1234 2>/dev/null
-          ./target/release/simple-http-server.exe --cert "$RUNNER_TEMP/t.p12" --certpass test1234 \
-            --ip 127.0.0.1 --port 8444 . &
-          SPID=$!
-          sleep 4
-          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://127.0.0.1:8444/ || true)
-          kill $SPID 2>/dev/null || true
-          echo "HTTPS smoke test HTTP status: $code"
-          if [ "$code" != "200" ]; then echo "::error::smoke test failed (status $code)"; exit 1; fi
-          echo "Smoke test PASSED: the exe serves HTTPS."
+          # --- make a full Perl visible for the vendored OpenSSL build -------------
+          # Git Bash's bundled Perl lacks core modules (Locale::Maketext::Simple etc.)
+          # which makes openssl-src's `perl Configure` die with exit code 2.
+          for d in /c/Strawberry/perl/bin /c/Strawberry /c/tools/perl/bin /c/Perl64/bin /c/Perl/bin; do
+            if [ -x "$d/perl.exe" ] && "$d/perl.exe" -MLocale::Maketext::Simple -e 'exit 0' >/dev/null 2>&1; then
+              echo "Using full Perl from: $d"
+              export PATH="$d:$PATH"
+              break
+            fi
+          done
+          if ! perl -MLocale::Maketext::Simple -e 'print "ok\n"' >/dev/null 2>&1; then
+            echo 'No usable Perl found on the image; installing Strawberry Perl via chocolatey...'
+            choco install -y strawberryperl --no-progress
+            export PATH="/c/Strawberry/perl/bin:$PATH"
+          fi
+          perl -MLocale::Maketext::Simple -e 'print "perl ready for vendored OpenSSL\n"' \
+            || { echo '::error::no full Perl available - vendored OpenSSL cannot be configured'; exit 1; }
+          # ---------------------------------------------------------------------------
+          cargo build --release
+
+      - name: Smoke test (serve HTTPS with a throwaway self-signed p12)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p12 = Join-Path $env:RUNNER_TEMP 'smoke.p12'
+          $cert = New-SelfSignedCertificate -Subject 'CN=localhost' -KeyExportPolicy Exportable -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddDays(2)
+          $pw = ConvertTo-SecureString 'test1234' -AsPlainText -Force
+          Export-PfxCertificate -Cert $cert -FilePath $p12 -Password $pw | Out-Null
+          $exe = Join-Path (Get-Location) 'target\release\simple-http-server.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'smoke-server.log'
+          $p = Start-Process -FilePath $exe -ArgumentList @('--cert', $p12, '--certpass', 'test1234', '--ip', '127.0.0.1', '--port', '8444', '.') -PassThru -NoNewWindow -RedirectStandardOutput $out
+          try {
+            $code = ''
+            for ($i = 0; $i -lt 10 -and $code -ne '200'; $i++) {
+              Start-Sleep -Seconds 1
+              $code = (& curl.exe -k -s -o NUL -w '%{http_code}' https://127.0.0.1:8444/ 2>$null)
+            }
+            Write-Host "HTTPS smoke test HTTP status: $code"
+            if ($code -ne '200') {
+              Write-Host '--- server output so far:'
+              Get-Content $out -ErrorAction SilentlyContinue
+              throw "smoke test failed (status $code)"
+            }
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
+          }
+          Write-Host 'Smoke test PASSED: the exe serves HTTPS.'
 
       - name: Write usage note
         shell: bash
